@@ -55,6 +55,7 @@ display:grid;place-items:end start}
 #fsBig{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:3;padding:1.1em 1.8em;font-size:1.25rem;box-shadow:0 0 0 8px rgba(255,255,255,.12)}
 #gline{position:absolute;left:0;right:0;top:calc(50% + 4.2rem);text-align:center;color:var(--muted);font-size:.9rem;z-index:3;padding:0 16px}
 #guest.calm #fsBig,#guest.calm #gline{display:none}
+#guest.calm.needtap #gline{display:block;color:#fff;font-weight:600}
 @media (prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
 </style>
 </head>
@@ -64,7 +65,7 @@ display:grid;place-items:end start}
 <main id="host" hidden>
   <header>
     <h1>Light show</h1>
-    <p class="muted" id="ver" style="margin:0 0 .4em;font-size:.8rem">Version 14</p>
+    <p class="muted" id="ver" style="margin:0 0 .4em;font-size:.8rem">Version 15</p>
     <p class="muted" id="hostStatus">Starting…</p>
     <button id="hostFs" class="ghost">Go full screen</button>
   </header>
@@ -260,7 +261,17 @@ class WebPlayer {
 class GuestAudio{
   constructor(){ this.ctx=null; this.buf=null; this.src=null; this.off=0; this.t0=0; this.rate=1; this.key=''; }
   ensure(){ if(!this.ctx){ const AC=window.AudioContext||window.webkitAudioContext; this.ctx=new AC(); } return this.ctx; }
-  unlock(){ try{ this.ensure().resume(); }catch(e){} }
+  unlock(){
+    try{ this.ensure().resume(); }catch(e){}
+    try{ if(navigator.audioSession) navigator.audioSession.type='playback'; }catch(e){}   // iPhone: sound even with the silent switch on
+    if(!this.sil){ try{
+      const n=800,u=new Uint8Array(44+n),dv=new DataView(u.buffer),W=(o,s)=>{for(let i=0;i<s.length;i++)u[o+i]=s.charCodeAt(i)};
+      W(0,'RIFF');dv.setUint32(4,36+n,true);W(8,'WAVEfmt ');dv.setUint32(16,16,true);dv.setUint16(20,1,true);dv.setUint16(22,1,true);
+      dv.setUint32(24,8000,true);dv.setUint32(28,8000,true);dv.setUint16(32,1,true);dv.setUint16(34,8,true);W(36,'data');dv.setUint32(40,n,true);u.fill(128,44);
+      let s='';u.forEach(b=>s+=String.fromCharCode(b)); const a=new Audio('data:audio/wav;base64,'+btoa(s)); a.loop=true; this.sil=a;
+    }catch(e){} }
+    try{ if(this.sil){ const p=this.sil.play(); p&&p.catch&&p.catch(()=>{}); } }catch(e){}
+  }
   async load(ab){ this.stop(); this.buf=await new Promise((ok,no)=>this.ensure().decodeAudioData(ab,ok,no)); }
   get lat(){ return this.ctx.outputLatency||this.ctx.baseLatency||0; }
   pos(){ return this.src ? this.off+(this.ctx.currentTime-this.t0)*this.rate-this.lat : null; }   // position actually heard
@@ -678,7 +689,7 @@ function startHost(){
     $('seek').max=audio.duration;
     ['play','pause','stop','pvLaptop','pvPhones'].forEach(id=>$(id).disabled=false);
     diag('Ready: '+fmt(audio.duration)+' long. Press Play show.');
-    conns.forEach(c=>{ if(c.open) sendAudio(c); });
+    conns.forEach(c=>{ c._ready=false; c._bad=false; c._have=''; if(c.open) sendAudio(c); }); upd();
   });
   audio.addEventListener('playing',()=>diag('Playing.'));
 
@@ -776,7 +787,9 @@ function startHost(){
     peer.on('open',()=>{ if(!local) $('hostStatus').textContent='Ready. Pick a file, then let devices join.'; });
     peer.on('connection',c=>{
       c.on('open',()=>{conns.add(c);upd();sendState()});
-      c.on('data',m=>{ if(m.t==='ping') c.send({t:'pong',c:m.c,s:Date.now()}); if(m.t==='hello'){ c._have=m.have; sendAudio(c); } });
+      c.on('data',m=>{ if(m.t==='ping') c.send({t:'pong',c:m.c,s:Date.now()}); if(m.t==='hello'){ c._have=m.have; sendAudio(c); }
+        if(m.t==='audio-ready'){ c._ready=true; c._bad=false; c._have=m.key; upd(); }
+        if(m.t==='audio-error'){ c._bad=true; c._ready=false; diag('A device could not decode the song: '+m.msg); upd(); } });
       c.on('close',()=>{conns.delete(c);upd()});
       c.on('error',()=>{conns.delete(c);upd()});
     });
@@ -786,23 +799,27 @@ function startHost(){
     });
     peer.on('disconnected',()=>{ try{peer.reconnect()}catch(e){} });
   }
-  // send the song file to a device, in small pieces (skipped if that device already has it)
+  // send the song file to a device as small text pieces over an ordered connection; the device confirms when it has it
   let sendId=0;
+  const b64=u=>{ let s=''; for(let i=0;i<u.length;i+=8192) s+=String.fromCharCode.apply(null,u.subarray(i,Math.min(i+8192,u.length))); return btoa(s); };
   async function sendAudio(c){
     if(!audio.raw||c._have===audio.key) return;
-    const id=++sendId, raw=audio.raw, N=16384, n=Math.ceil(raw.byteLength/N); c._aid=id;
-    c.send({t:'audio-start',id,key:audio.key,size:raw.byteLength,n});
+    const id=++sendId, bytes=new Uint8Array(audio.raw), N=12288, n=Math.ceil(bytes.length/N); c._aid=id; c._ready=false; upd();
+    c.send({t:'audio-start',id,key:audio.key,size:bytes.length,n});
     for(let i=0;i<n;i++){
       if(!c.open||c._aid!==id) return;
       while(c.dataChannel&&c.dataChannel.bufferedAmount>1048576) await new Promise(r=>setTimeout(r,30));
-      c.send({t:'audio-chunk',id,i,d:raw.slice(i*N,(i+1)*N)});
+      c.send({t:'audio-chunk',id,i,d:b64(bytes.subarray(i*N,(i+1)*N))});
       if(i%32===31) await new Promise(r=>setTimeout(r,0));
     }
-    c._have=audio.key;
+    c.send({t:'audio-end',id});
   }
   function upd(){
-    $('count').textContent=conns.size+(conns.size===1?' device connected':' devices connected');
-    $('dot').classList.toggle('on',conns.size>0);
+    const all=[...conns], n=all.length, ready=all.filter(c=>c._ready).length, bad=all.filter(c=>c._bad).length;
+    let t=n+(n===1?' device connected':' devices connected');
+    if(n&&audio.raw) t+=' · song ready on '+ready+' of '+n; else if(n) t+=' · choose the song to send it';
+    if(bad) t+=' · '+bad+' can’t play it';
+    $('count').textContent=t; $('dot').classList.toggle('on',n>0);
   }
   if(!local) $('hostStatus').textContent='Starting…';
   Promise.all([
@@ -856,29 +873,42 @@ function startGuest(hostId){
     else ga.adjust(1-Math.max(-.03,Math.min(.03,(p-r)*.5)));
   },250);
 
+  function finishSong(){
+    const r=rx; rx=null; const all=new Uint8Array(r.size); let o=0; r.parts.forEach(q=>{all.set(q,o);o+=q.byteLength});
+    ga.load(all.buffer).then(()=>{ ga.key=r.key; problem=false; status('Connected · song ready',true); ui(); if(conn&&conn.open) conn.send({t:'audio-ready',key:r.key}); })
+      .catch(err=>{ problem=true; status('This device could not decode the song.'); ui(); if(conn&&conn.open) conn.send({t:'audio-error',msg:String(err&&err.message||err)}); });
+  }
+  // if the transfer stalls, ask the coordinator to send it again
+  setInterval(()=>{ if(rx&&Date.now()-rx.last>8000){ rx=null; status('Song transfer stalled, retrying…',true); if(conn&&conn.open) conn.send({t:'hello',have:''}); } },3000);
+  // any tap anywhere unlocks sound (phones block sound until the person touches the screen)
+  ['pointerdown','touchstart','click'].forEach(ev=>document.addEventListener(ev,()=>ga.unlock(),{passive:true}));
+  let needTap=false;
+  setInterval(()=>{
+    const need=!!(base&&base.playing&&ga.buf&&ga.ctx&&ga.ctx.state!=='running');
+    if(need!==needTap){ needTap=need; g.classList.toggle('needtap',need); status(need?'Tap the screen to turn on sound':(ga.buf?'Connected · song ready':'Connected'),connected); }
+  },400);
+
   function connect(){
     status('Connecting…');
     if(typeof Peer==='undefined'){ status('Could not load PeerJS. Check the internet connection.'); return; }
     const peer=new Peer();
     peer.on('open',()=>{
-      conn=peer.connect(hostId,{reliable:true});
+      conn=peer.connect(hostId,{reliable:true,serialization:'json'});
       conn.on('open',()=>{connected=true;status('Connected',true);ui();burst();conn.send({t:'hello',have:ga.key||''});});
       conn.on('data',m=>{
         if(m.t==='pong'){ const rtt=Date.now()-m.c; if(rtt<best){best=rtt;offset=m.s+rtt/2-Date.now()} }
         if(m.t==='state'){ const wasPlaying=base&&base.playing; base=m;
           if(!m.playing) eng.reset(); else if(!wasPlaying) eng.reset(); }
-        if(m.t==='audio-start'){ rx={id:m.id,size:m.size,key:m.key,parts:[],bytes:0}; problem=false; status('Loading song 0%',true); ui(); }
+        if(m.t==='audio-start'){ rx={id:m.id,size:m.size,key:m.key,n:m.n,parts:new Array(m.n),got:0,last:Date.now()}; problem=false; status('Loading song 0%',true); ui(); }
         if(m.t==='audio-chunk'&&rx&&rx.id===m.id){
-          const d=m.d, u=d instanceof ArrayBuffer?new Uint8Array(d):new Uint8Array(d.buffer,d.byteOffset,d.byteLength);
-          rx.parts.push(u); rx.bytes+=u.byteLength; status('Loading song '+Math.floor(rx.bytes/rx.size*100)+'%',true);
-          if(rx.bytes>=rx.size){
-            const all=new Uint8Array(rx.size); let o=0; rx.parts.forEach(q=>{all.set(q,o);o+=q.byteLength}); const key=rx.key; rx=null;
-            ga.load(all.buffer).then(()=>{ga.key=key;status('Connected',true);ui();})
-              .catch(()=>{problem=true;status('This device could not decode the song.');ui();});
-          }
+          const s=atob(m.d), u=new Uint8Array(s.length); for(let k=0;k<s.length;k++) u[k]=s.charCodeAt(k);
+          if(!rx.parts[m.i]){ rx.parts[m.i]=u; rx.got++; }
+          rx.last=Date.now(); status('Loading song '+Math.floor(rx.got/rx.n*100)+'%',true);
+          if(rx.got>=rx.n) finishSong();
         }
+        if(m.t==='audio-end'&&rx&&rx.id===m.id&&rx.got<rx.n){ rx=null; status('Song transfer incomplete, asking again…',true); conn.send({t:'hello',have:''}); }
       });
-      conn.on('close',()=>{connected=false;ui();status('Disconnected, retrying…');eng.reset();ga.stop();setTimeout(()=>{peer.destroy();connect()},2000)});
+      conn.on('close',()=>{connected=false;rx=null;ui();status('Disconnected, retrying…');eng.reset();ga.stop();setTimeout(()=>{peer.destroy();connect()},2000)});
       conn.on('error',()=>{});
     });
     peer.on('error',e=>{connected=false;ui();status('Can’t reach the coordinator ('+e.type+'), retrying…');setTimeout(()=>{peer.destroy();connect()},3000)});
