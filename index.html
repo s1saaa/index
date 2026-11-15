@@ -52,12 +52,9 @@ display:grid;place-items:end start}
 
 /* guest */
 #guest{position:fixed;inset:0;background:#000;overflow:hidden}
-#bar{position:absolute;left:0;right:0;top:0;padding:max(14px,env(safe-area-inset-top)) 14px 14px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;
-background:rgba(10,8,16,.82);transition:opacity .3s;z-index:2}
-#guest:not(.ui) #bar{opacity:0;pointer-events:none}
-#bar .grow{flex:1 1 140px}
 #fsBig{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:3;padding:1.1em 1.8em;font-size:1.25rem;box-shadow:0 0 0 8px rgba(255,255,255,.12)}
-#hint{position:absolute;left:0;right:0;bottom:0;padding:16px 16px max(16px,env(safe-area-inset-bottom));color:var(--muted);font-size:.9rem;z-index:2}
+#gline{position:absolute;left:0;right:0;top:calc(50% + 4.2rem);text-align:center;color:var(--muted);font-size:.9rem;z-index:3;padding:0 16px}
+#guest.calm #fsBig,#guest.calm #gline{display:none}
 @media (prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
 </style>
 </head>
@@ -67,7 +64,7 @@ background:rgba(10,8,16,.82);transition:opacity .3s;z-index:2}
 <main id="host" hidden>
   <header>
     <h1>Light show</h1>
-    <p class="muted" id="ver" style="margin:0 0 .4em;font-size:.8rem">Version 13</p>
+    <p class="muted" id="ver" style="margin:0 0 .4em;font-size:.8rem">Version 14</p>
     <p class="muted" id="hostStatus">Starting…</p>
     <button id="hostFs" class="ghost">Go full screen</button>
   </header>
@@ -124,13 +121,8 @@ background:rgba(10,8,16,.82);transition:opacity .3s;z-index:2}
 <main id="guest" hidden>
   <canvas class="scene" id="guestScene"></canvas>
   <div class="light" id="guestLight"></div>
-  <div id="bar">
-    <span class="grow"><span class="dot" id="gdot"></span><span id="gstatus">Connecting…</span></span>
-    <button id="fs">Go full screen</button>
-    <button id="pvGuest" class="ghost">Preview</button>
-  </div>
-  <button id="fsBig">Tap to go full screen</button>
-  <div id="hint"></div>
+  <button id="fsBig">Go full screen</button>
+  <div id="gline"><span class="dot" id="gdot"></span><span id="gstatus">Connecting…</span></div>
 </main>
 
 
@@ -241,7 +233,9 @@ class WebPlayer {
     this._stop(); this.playing=false; this.off=0;
     const data=file.arrayBuffer ? await file.arrayBuffer()
       : await new Promise((ok,no)=>{const r=new FileReader();r.onload=()=>ok(r.result);r.onerror=()=>no(r.error);r.readAsArrayBuffer(file)});
+    const raw=data.slice(0);
     this.buf=await new Promise((ok,no)=>this.ctx.decodeAudioData(data,ok,no));
+    this.raw=raw; this.key=file.size+':'+(file.name||'');
     this.duration=this.buf.duration;
     this.emit('canplay');
   }
@@ -260,6 +254,24 @@ class WebPlayer {
     this._start(); this.emit('playing');
   }
   pause(){ if(!this.playing) return; this.off=this.currentTime; this._stop(); this.emit('pause'); }
+}
+
+/* ================= SONG PLAYER ON PHONES (plays the copy received from the coordinator) ================= */
+class GuestAudio{
+  constructor(){ this.ctx=null; this.buf=null; this.src=null; this.off=0; this.t0=0; this.rate=1; this.key=''; }
+  ensure(){ if(!this.ctx){ const AC=window.AudioContext||window.webkitAudioContext; this.ctx=new AC(); } return this.ctx; }
+  unlock(){ try{ this.ensure().resume(); }catch(e){} }
+  async load(ab){ this.stop(); this.buf=await new Promise((ok,no)=>this.ensure().decodeAudioData(ab,ok,no)); }
+  get lat(){ return this.ctx.outputLatency||this.ctx.baseLatency||0; }
+  pos(){ return this.src ? this.off+(this.ctx.currentTime-this.t0)*this.rate-this.lat : null; }   // position actually heard
+  start(p){
+    this.stop(); if(!this.buf||p>=this.buf.duration||this.ctx.state!=='running') return;
+    const s=this.ctx.createBufferSource(); s.buffer=this.buf; s.connect(this.ctx.destination);
+    s.onended=()=>{ if(this.src===s) this.src=null; };
+    this.src=s; this.rate=1; this.off=Math.max(0,p+this.lat); this.t0=this.ctx.currentTime; s.start(0,this.off);
+  }
+  adjust(r){ if(!this.src) return; const now=this.ctx.currentTime; this.off+=(now-this.t0)*this.rate; this.t0=now; this.rate=r; this.src.playbackRate.value=r; }
+  stop(){ if(this.src){ const s=this.src; this.src=null; s.onended=null; try{s.stop()}catch(e){} } }
 }
 
 /* ================= EMBEDDED WARNING ================= */
@@ -666,6 +678,7 @@ function startHost(){
     $('seek').max=audio.duration;
     ['play','pause','stop','pvLaptop','pvPhones'].forEach(id=>$(id).disabled=false);
     diag('Ready: '+fmt(audio.duration)+' long. Press Play show.');
+    conns.forEach(c=>{ if(c.open) sendAudio(c); });
   });
   audio.addEventListener('playing',()=>diag('Playing.'));
 
@@ -763,7 +776,7 @@ function startHost(){
     peer.on('open',()=>{ if(!local) $('hostStatus').textContent='Ready. Pick a file, then let devices join.'; });
     peer.on('connection',c=>{
       c.on('open',()=>{conns.add(c);upd();sendState()});
-      c.on('data',m=>{ if(m.t==='ping') c.send({t:'pong',c:m.c,s:Date.now()}); });
+      c.on('data',m=>{ if(m.t==='ping') c.send({t:'pong',c:m.c,s:Date.now()}); if(m.t==='hello'){ c._have=m.have; sendAudio(c); } });
       c.on('close',()=>{conns.delete(c);upd()});
       c.on('error',()=>{conns.delete(c);upd()});
     });
@@ -772,6 +785,20 @@ function startHost(){
       $('hostStatus').textContent='Could not reach the PeerJS server ('+e.type+'). The link works, but devices can’t join until this is fixed.';
     });
     peer.on('disconnected',()=>{ try{peer.reconnect()}catch(e){} });
+  }
+  // send the song file to a device, in small pieces (skipped if that device already has it)
+  let sendId=0;
+  async function sendAudio(c){
+    if(!audio.raw||c._have===audio.key) return;
+    const id=++sendId, raw=audio.raw, N=16384, n=Math.ceil(raw.byteLength/N); c._aid=id;
+    c.send({t:'audio-start',id,key:audio.key,size:raw.byteLength,n});
+    for(let i=0;i<n;i++){
+      if(!c.open||c._aid!==id) return;
+      while(c.dataChannel&&c.dataChannel.bufferedAmount>1048576) await new Promise(r=>setTimeout(r,30));
+      c.send({t:'audio-chunk',id,i,d:raw.slice(i*N,(i+1)*N)});
+      if(i%32===31) await new Promise(r=>setTimeout(r,0));
+    }
+    c._have=audio.key;
   }
   function upd(){
     $('count').textContent=conns.size+(conns.size===1?' device connected':' devices connected');
@@ -789,8 +816,8 @@ function startHost(){
 function startGuest(hostId){
   const g=$('guest'); g.hidden=false; document.body.style.overflow='hidden';
   const L=$('guestLight');
-  let offset=0, best=1e9, base=null, conn=null, pv=null, uiTimer;
-
+  let offset=0, best=1e9, base=null, conn=null, connected=false, problem=false, started=false, rx=null;
+  const ga=new GuestAudio();
   const guestScenes=makeScenes($('guestScene'));
   const eng=makeEngine({
     cue(c){ fire(L,c);
@@ -799,52 +826,35 @@ function startGuest(hostId){
     stop(){ clearLight(L); guestScenes.clear(); vib(0); },
     end(){ vib(0); }
   });
+  const status=(t,on)=>{$('gstatus').textContent=t;$('gdot').classList.toggle('on',!!on)};
 
-  $('hint').textContent = canVibrate ? '' : 'This device can’t vibrate (iPhones don’t allow it in the browser). You’ll get the lights.';
-
-  // UI: tap to show/hide the bar
-  const showUI=()=>{g.classList.add('ui');clearTimeout(uiTimer);uiTimer=setTimeout(()=>g.classList.remove('ui'),4000)};
-  g.addEventListener('click',e=>{ if(e.target.closest('button'))return; g.classList.contains('ui')?g.classList.remove('ui'):showUI() });
-  showUI();
-
-  // full screen + user-initiated vibration
+  // the only control: full screen (this tap also unlocks sound and vibration)
   const docEl=document.documentElement;
   const canFS=!!(docEl.requestFullscreen||docEl.webkitRequestFullscreen);
   const isFS=()=>!!(document.fullscreenElement||document.webkitFullscreenElement);
-  let connected=false;
-  function syncFS(){
-    const f=isFS();
-    $('fs').textContent=f?'Exit full screen':'Go full screen';
-    $('fsBig').hidden=f||!canFS;
-  }
-  async function goFS(){
-    vib(40);                                    // unlocks vibration (needs a user gesture)
-    try{ await (docEl.requestFullscreen||docEl.webkitRequestFullscreen).call(docEl); }
-    catch(e){ $('hint').textContent='Full screen is blocked here. Open this page in its own browser tab.'; showUI(); }
+  const ui=()=>g.classList.toggle('calm',(isFS()||(!canFS&&started))&&connected&&!problem);
+  ['fullscreenchange','webkitfullscreenchange'].forEach(ev=>document.addEventListener(ev,ui));
+  if(!canFS) $('fsBig').textContent='Tap to start';   // iPhone Safari has no full screen mode
+  $('fsBig').onclick=async()=>{
+    started=true; ga.unlock(); vib(40);
+    if(canFS){ try{ await (docEl.requestFullscreen||docEl.webkitRequestFullscreen).call(docEl); }
+      catch(e){ status('Full screen is blocked here. Open this page in its own browser tab.',connected); } }
     try{ await navigator.wakeLock.request('screen'); }catch(e){}
-    syncFS(); showUI();
-  }
-  function toggleFS(){ if(isFS()){ (document.exitFullscreen||document.webkitExitFullscreen).call(document); } else goFS(); }
-  $('fs').onclick=toggleFS; $('fsBig').onclick=goFS;
-  ['fullscreenchange','webkitfullscreenchange'].forEach(ev=>document.addEventListener(ev,syncFS));
-  if(!canFS){ $('fs').hidden=true;
-    $('hint').textContent=($('hint').textContent+' This browser has no full screen mode; on iPhone, use Share → Add to Home Screen and open it from there.').trim(); }
-
-  // local preview of lights + vibration on this device
-  $('pvGuest').onclick=()=>{
-    vib(40); eng.reset(); base=null;
-    pv={from:SEGMENTS[0][0]-1,t0:performance.now(),len:9};
-    showUI();
+    ui();
   };
 
-  const posNow=()=>{
-    if(pv){ const e=(performance.now()-pv.t0)/1000; if(e>pv.len){pv=null;eng.reset();return null} return pv.from+e; }
-    if(base&&base.playing) return base.pos+(Date.now()+offset-base.at)/1000-base.delay/1000;
-    return null;
-  };
+  const rawNow=()=> base&&base.playing ? base.pos+(Date.now()+offset-base.at)/1000 : null;   // song position on the coordinator
+  const posNow=()=>{ const r=rawNow(); return r===null?null:r-base.delay/1000; };              // lights use the delay setting
   (function loop(){ const p=posNow(); if(p!==null){ eng.tick(p); guestScenes.render(p); } else guestScenes.clear(); requestAnimationFrame(loop) })();
 
-  const status=(t,on)=>{$('gstatus').textContent=t;$('gdot').classList.toggle('on',!!on)};
+  // keep this device's copy of the song in step with the coordinator
+  setInterval(()=>{
+    if(!ga.buf) return;
+    const r=rawNow(); if(r===null){ ga.stop(); return; }
+    const p=ga.pos();
+    if(p===null||Math.abs(p-r)>.3) ga.start(r);
+    else ga.adjust(1-Math.max(-.03,Math.min(.03,(p-r)*.5)));
+  },250);
 
   function connect(){
     status('Connecting…');
@@ -852,20 +862,29 @@ function startGuest(hostId){
     const peer=new Peer();
     peer.on('open',()=>{
       conn=peer.connect(hostId,{reliable:true});
-      conn.on('open',()=>{status('Connected',true);connected=true;$('fs').disabled=false;syncFS();burst();});
+      conn.on('open',()=>{connected=true;status('Connected',true);ui();burst();conn.send({t:'hello',have:ga.key||''});});
       conn.on('data',m=>{
         if(m.t==='pong'){ const rtt=Date.now()-m.c; if(rtt<best){best=rtt;offset=m.s+rtt/2-Date.now()} }
         if(m.t==='state'){ const wasPlaying=base&&base.playing; base=m;
           if(!m.playing) eng.reset(); else if(!wasPlaying) eng.reset(); }
+        if(m.t==='audio-start'){ rx={id:m.id,size:m.size,key:m.key,parts:[],bytes:0}; problem=false; status('Loading song 0%',true); ui(); }
+        if(m.t==='audio-chunk'&&rx&&rx.id===m.id){
+          const d=m.d, u=d instanceof ArrayBuffer?new Uint8Array(d):new Uint8Array(d.buffer,d.byteOffset,d.byteLength);
+          rx.parts.push(u); rx.bytes+=u.byteLength; status('Loading song '+Math.floor(rx.bytes/rx.size*100)+'%',true);
+          if(rx.bytes>=rx.size){
+            const all=new Uint8Array(rx.size); let o=0; rx.parts.forEach(q=>{all.set(q,o);o+=q.byteLength}); const key=rx.key; rx=null;
+            ga.load(all.buffer).then(()=>{ga.key=key;status('Connected',true);ui();})
+              .catch(()=>{problem=true;status('This device could not decode the song.');ui();});
+          }
+        }
       });
-      conn.on('close',()=>{status('Disconnected, retrying…');eng.reset();setTimeout(()=>{peer.destroy();connect()},2000)});
+      conn.on('close',()=>{connected=false;ui();status('Disconnected, retrying…');eng.reset();ga.stop();setTimeout(()=>{peer.destroy();connect()},2000)});
       conn.on('error',()=>{});
     });
-    peer.on('error',e=>{status('Can’t reach the coordinator ('+e.type+'), retrying…');setTimeout(()=>{peer.destroy();connect()},3000)});
+    peer.on('error',e=>{connected=false;ui();status('Can’t reach the coordinator ('+e.type+'), retrying…');setTimeout(()=>{peer.destroy();connect()},3000)});
   }
   function burst(){ best=1e9; let n=0; const t=setInterval(()=>{ if(conn&&conn.open) conn.send({t:'ping',c:Date.now()}); if(++n>=10)clearInterval(t)},150); }
   setInterval(()=>{ if(conn&&conn.open) burst() },15000);   // keep the clock offset fresh
-  syncFS();
   connect();
 }
 </script>
