@@ -66,7 +66,7 @@ display:grid;place-items:end start}
 <main id="host" hidden>
   <header>
     <h1>Light show</h1>
-    <p class="muted" id="ver" style="margin:0 0 .4em;font-size:.8rem">Version 16</p>
+    <p class="muted" id="ver" style="margin:0 0 .4em;font-size:.8rem">Version 17</p>
     <p class="muted" id="hostStatus">Starting…</p>
     <button id="hostFs" class="ghost">Go full screen</button>
   </header>
@@ -75,7 +75,7 @@ display:grid;place-items:end start}
     <label class="file" id="fileLabel">
       <input type="file" id="file" accept="audio/*,video/*">
       <strong id="fileName">Choose the media file</strong><br>
-      <span class="muted">It plays from this computer. Phones only show lights and vibrate.</span>
+      <span class="muted">It plays from this computer and streams live to the phones.</span>
     </label>
     <p class="muted" id="diag" style="margin:0;font-size:.9rem">No file chosen yet.</p>
     <div class="row split">
@@ -215,9 +215,14 @@ const fmt = s => { s=Math.max(0,s); return Math.floor(s/60)+':'+(s%60).toFixed(1
 
 /* ================= WEB AUDIO PLAYER (no <audio> element / blob URL needed) ================= */
 class WebPlayer {
-  constructor(){ this._l={}; this.ctx=null; this.buf=null; this.src=null; this.off=0; this.t0=0; this.playing=false; this.duration=0; }
+  constructor(){ this._l={}; this.ctx=null; this.dest=null; this.buf=null; this.src=null; this.off=0; this.t0=0; this.playing=false; this.duration=0; }
   addEventListener(t,f){ (this._l[t]=this._l[t]||[]).push(f); }
   emit(t){ (this._l[t]||[]).slice().forEach(f=>f({type:t})); }
+  ensure(){
+    if(!this.ctx){ const AC=window.AudioContext||window.webkitAudioContext; this.ctx=new AC(); }
+    if(!this.dest) this.dest=this.ctx.createMediaStreamDestination();   // live audio feed that is sent to the devices
+    return this.ctx;
+  }
   get paused(){ return !this.playing; }
   get currentTime(){
     if(!this.buf) return 0;
@@ -231,8 +236,7 @@ class WebPlayer {
     this.emit('seeked');
   }
   async load(file){
-    const AC=window.AudioContext||window.webkitAudioContext;
-    if(!this.ctx) this.ctx=new AC();
+    this.ensure();
     this._stop(); this.playing=false; this.off=0;
     const data=file.arrayBuffer ? await file.arrayBuffer()
       : await new Promise((ok,no)=>{const r=new FileReader();r.onload=()=>ok(r.result);r.onerror=()=>no(r.error);r.readAsArrayBuffer(file)});
@@ -243,7 +247,7 @@ class WebPlayer {
     this.emit('canplay');
   }
   _start(){
-    const s=this.ctx.createBufferSource(); s.buffer=this.buf; s.connect(this.ctx.destination);
+    const s=this.ctx.createBufferSource(); s.buffer=this.buf; s.connect(this.ctx.destination); s.connect(this.dest);
     s.onended=()=>{ if(this.src===s && this.playing){ this.playing=false; this.off=0; this.src=null; this.emit('ended'); } };
     this.src=s; this.t0=this.ctx.currentTime; this.playing=true;
     s.start(0,this.off);
@@ -259,32 +263,18 @@ class WebPlayer {
   pause(){ if(!this.playing) return; this.off=this.currentTime; this._stop(); this.emit('pause'); }
 }
 
-/* ================= SONG PLAYER ON PHONES (plays the copy received from the coordinator) ================= */
+/* ================= LIVE SOUND ON DEVICES (the coordinator streams the song to us) ================= */
 class GuestAudio{
-  constructor(){ this.ctx=null; this.buf=null; this.src=null; this.off=0; this.t0=0; this.rate=1; this.key=''; }
-  ensure(){ if(!this.ctx){ const AC=window.AudioContext||window.webkitAudioContext; this.ctx=new AC(); } return this.ctx; }
-  unlock(){
-    try{ this.ensure().resume(); }catch(e){}
-    try{ if(navigator.audioSession) navigator.audioSession.type='playback'; }catch(e){}   // iPhone: sound even with the silent switch on
-    if(!this.sil){ try{
-      const n=800,u=new Uint8Array(44+n),dv=new DataView(u.buffer),W=(o,s)=>{for(let i=0;i<s.length;i++)u[o+i]=s.charCodeAt(i)};
-      W(0,'RIFF');dv.setUint32(4,36+n,true);W(8,'WAVEfmt ');dv.setUint32(16,16,true);dv.setUint16(20,1,true);dv.setUint16(22,1,true);
-      dv.setUint32(24,8000,true);dv.setUint32(28,8000,true);dv.setUint16(32,1,true);dv.setUint16(34,8,true);W(36,'data');dv.setUint32(40,n,true);u.fill(128,44);
-      let s='';u.forEach(b=>s+=String.fromCharCode(b)); const a=new Audio('data:audio/wav;base64,'+btoa(s)); a.loop=true; this.sil=a;
-    }catch(e){} }
-    try{ if(this.sil){ const p=this.sil.play(); p&&p.catch&&p.catch(()=>{}); } }catch(e){}
+  constructor(){ this.el=null; this.stream=null; }
+  get ok(){ return !!(this.el&&this.stream&&!this.el.paused&&!this.el.ended); }
+  attach(s){
+    this.stream=s;
+    if(!this.el){ const a=document.createElement('audio'); a.autoplay=true; a.setAttribute('playsinline',''); a.style.display='none'; document.body.appendChild(a); this.el=a; }
+    this.el.srcObject=s; this.tryPlay();
   }
-  async load(ab){ this.stop(); this.buf=await new Promise((ok,no)=>this.ensure().decodeAudioData(ab,ok,no)); }
-  get lat(){ return this.ctx.outputLatency||this.ctx.baseLatency||0; }
-  pos(){ return this.src ? this.off+(this.ctx.currentTime-this.t0)*this.rate-this.lat : null; }   // position actually heard
-  start(p){
-    this.stop(); if(!this.buf||p>=this.buf.duration||this.ctx.state!=='running') return;
-    const s=this.ctx.createBufferSource(); s.buffer=this.buf; s.connect(this.ctx.destination);
-    s.onended=()=>{ if(this.src===s) this.src=null; };
-    this.src=s; this.rate=1; this.off=Math.max(0,p+this.lat); this.t0=this.ctx.currentTime; s.start(0,this.off);
-  }
-  adjust(r){ if(!this.src) return; const now=this.ctx.currentTime; this.off+=(now-this.t0)*this.rate; this.t0=now; this.rate=r; this.src.playbackRate.value=r; }
-  stop(){ if(this.src){ const s=this.src; this.src=null; s.onended=null; try{s.stop()}catch(e){} } }
+  detach(){ this.stream=null; if(this.el){ try{this.el.pause()}catch(e){} this.el.srcObject=null; } }
+  tryPlay(){ if(this.el&&this.stream&&this.el.paused){ try{ const p=this.el.play(); p&&p.catch&&p.catch(()=>{}); }catch(e){} } }
+  unlock(){ try{ if(navigator.audioSession) navigator.audioSession.type='playback'; }catch(e){} this.tryPlay(); }
 }
 
 /* ================= EMBEDDED WARNING ================= */
@@ -660,6 +650,7 @@ joinId ? startGuest(joinId) : startHost();
 function startHost(){
   $('host').hidden=false;
   const audio=new WebPlayer(), stageLight=$('hostLight');
+  try{ audio.ensure(); }catch(e){}
   const conns=new Set();            // control connections (one per device): clock sync + show state
   const devs=new Map();             // device peer id -> {ctrl, aud, ready, bad, have}  (aud = separate connection that carries the song)
   let session=null, delay=0, seeking=false;
@@ -692,7 +683,7 @@ function startHost(){
     $('seek').max=audio.duration;
     ['play','pause','stop','pvLaptop','pvPhones'].forEach(id=>$(id).disabled=false);
     diag('Ready: '+fmt(audio.duration)+' long. Press Play show.');
-    devs.forEach(d=>{ d.ready=false; d.bad=false; d.have=''; sendAudio(d); }); upd();
+    upd();
   });
   audio.addEventListener('playing',()=>diag('Playing.'));
 
@@ -788,24 +779,23 @@ function startHost(){
   function openPeer(){
     const peer=new Peer(hid);
     peer.on('open',()=>{ if(!local) $('hostStatus').textContent='Ready. Pick a file, then let devices join.'; });
+    function callDevice(d,c){                     // stream the song audio live to this device
+      try{
+        if(d.call){ try{d.call.close()}catch(e){} }
+        const call=peer.call(c.peer,audio.dest.stream); d.call=call;
+        call.on('close',()=>{ if(d.call===call) d.call=null; });
+        call.on('error',()=>{ if(d.call===call) d.call=null; });
+      }catch(e){ diag('Could not start the sound stream: '+(e&&e.message||e)); }
+    }
+    setInterval(()=>{ devs.forEach(d=>{ if(d.ctrl&&d.ctrl.open&&!d.call) callDevice(d,d.ctrl); }); },5000);   // redial if a stream dropped
     peer.on('connection',c=>{
-      const isAudio=!!(c.metadata&&c.metadata.audio);
-      let d=devs.get(c.peer); if(!d){ d={ctrl:null,aud:null,ready:false,bad:false,have:''}; devs.set(c.peer,d); }
-      c.on('open',()=>{
-        if(isAudio){ d.aud=c; } else { d.ctrl=c; conns.add(c); sendState(); }
-        upd();
-      });
+      let d=devs.get(c.peer); if(!d){ d={ctrl:null,call:null,snd:false}; devs.set(c.peer,d); }
+      c.on('open',()=>{ d.ctrl=c; conns.add(c); sendState(); callDevice(d,c); upd(); });
       c.on('data',m=>{
         if(m.t==='ping') c.send({t:'pong',c:m.c,s:Date.now()});
-        if(m.t==='hello'){ d.have=m.have; sendAudio(d); }
-        if(m.t==='audio-ready'){ d.ready=true; d.bad=false; d.have=m.key; upd(); }
-        if(m.t==='audio-error'){ d.bad=true; d.ready=false; diag('A device could not decode the song: '+m.msg); upd(); }
+        if(m.t==='snd'){ d.snd=!!m.ok; upd(); }
       });
-      const gone=()=>{
-        if(isAudio){ if(d.aud===c) d.aud=null; } else { conns.delete(c); if(d.ctrl===c) d.ctrl=null; }
-        if(!d.ctrl&&!d.aud) devs.delete(c.peer);
-        upd();
-      };
+      const gone=()=>{ conns.delete(c); if(d.ctrl===c){ d.ctrl=null; if(d.call){ try{d.call.close()}catch(e){} d.call=null; } devs.delete(c.peer); } upd(); };
       c.on('close',gone); c.on('error',gone);
     });
     peer.on('error',e=>{
@@ -814,27 +804,10 @@ function startHost(){
     });
     peer.on('disconnected',()=>{ try{peer.reconnect()}catch(e){} });
   }
-  // the song goes to each device over its own separate connection, so it can never delay the lights
-  let sendId=0;
-  const b64=u=>{ let s=''; for(let i=0;i<u.length;i+=8192) s+=String.fromCharCode.apply(null,u.subarray(i,Math.min(i+8192,u.length))); return btoa(s); };
-  async function sendAudio(d){
-    const c=d.aud;
-    if(!c||!c.open||!audio.raw||d.have===audio.key) return;
-    const id=++sendId, bytes=new Uint8Array(audio.raw), N=12288, n=Math.ceil(bytes.length/N); d._aid=id; d.ready=false; upd();
-    c.send({t:'audio-start',id,key:audio.key,size:bytes.length,n});
-    for(let i=0;i<n;i++){
-      if(!c.open||d._aid!==id) return;
-      while(c.dataChannel&&c.dataChannel.bufferedAmount>262144) await new Promise(r=>setTimeout(r,25));
-      c.send({t:'audio-chunk',id,i,d:b64(bytes.subarray(i*N,(i+1)*N))});
-      if(i%16===15) await new Promise(r=>setTimeout(r,0));
-    }
-    c.send({t:'audio-end',id});
-  }
   function upd(){
-    const all=[...devs.values()].filter(d=>d.ctrl), n=all.length, ready=all.filter(d=>d.ready).length, bad=all.filter(d=>d.bad).length;
+    const all=[...devs.values()].filter(d=>d.ctrl), n=all.length, on=all.filter(d=>d.snd).length;
     let t=n+(n===1?' device connected':' devices connected');
-    if(n&&audio.raw) t+=' · song ready on '+ready+' of '+n; else if(n) t+=' · choose the song to send it';
-    if(bad) t+=' · '+bad+' can’t play it';
+    if(n) t+=' · sound playing on '+on+' of '+n+(on<n?' (each phone needs one tap)':'');
     $('count').textContent=t; $('dot').classList.toggle('on',n>0);
   }
   if(!local) $('hostStatus').textContent='Starting…';
@@ -849,7 +822,7 @@ function startHost(){
 function startGuest(hostId){
   const g=$('guest'); g.hidden=false; document.body.style.overflow='hidden';
   const L=$('guestLight');
-  let offset=0, best=1e9, base=null, conn=null, connected=false, problem=false, started=false, rx=null;
+  let offset=0, best=1e9, base=null, conn=null, connected=false, problem=false, started=false;
   const ga=new GuestAudio();
   const guestScenes=makeScenes($('guestScene'));
   const eng=makeEngine({
@@ -877,70 +850,48 @@ function startGuest(hostId){
   };
 
   const rawNow=()=> base&&base.playing ? base.pos+(Date.now()+offset-base.at)/1000 : null;   // song position on the coordinator
-  const posNow=()=>{ const r=rawNow(); return r===null?null:r-base.delay/1000; };              // lights use the delay setting
+  const posNow=()=>{ const r=rawNow(); return r===null?null:r-base.delay/1000-lagMs/1000; };   // lights wait for the live sound to arrive              // lights use the delay setting
   (function loop(){ const p=posNow(); if(p!==null){ eng.tick(p); guestScenes.render(p); } else guestScenes.clear(); requestAnimationFrame(loop) })();
 
-  // keep this device's copy of the song in step with the coordinator
-  setInterval(()=>{
-    if(!ga.buf) return;
-    const r=rawNow(); if(r===null){ ga.stop(); return; }
-    const p=ga.pos();
-    if(p===null||Math.abs(p-r)>.3) ga.start(r);
-    else ga.adjust(1-Math.max(-.03,Math.min(.03,(p-r)*.5)));
-  },250);
-
-  let aconn=null;                                   // separate connection that carries the song
-  const asend=m=>{ if(aconn&&aconn.open) aconn.send(m); };
-  function finishSong(){
-    const r=rx; rx=null; const all=new Uint8Array(r.size); let o=0; r.parts.forEach(q=>{all.set(q,o);o+=q.byteLength});
-    ga.load(all.buffer).then(()=>{ ga.key=r.key; problem=false; status('Connected · song ready',true); ui(); asend({t:'audio-ready',key:r.key}); })
-      .catch(err=>{ problem=true; status('This device could not decode the song.'); ui(); asend({t:'audio-error',msg:String(err&&err.message||err)}); });
+  // live sound: the coordinator calls this device with an audio stream; we measure how late it arrives and delay the lights to match
+  let lagMs=0, callRef=null;
+  async function measure(){
+    try{
+      if(!callRef||!callRef.peerConnection) return;
+      const st=await callRef.peerConnection.getStats(); let jb=0,jn=0,rtt=0;
+      st.forEach(r=>{
+        if(r.type==='inbound-rtp'&&(r.kind==='audio'||r.mediaType==='audio')){ jb=r.jitterBufferDelay||0; jn=r.jitterBufferEmittedCount||0; }
+        if(r.type==='candidate-pair'&&(r.nominated||r.selected)&&r.currentRoundTripTime!=null) rtt=r.currentRoundTripTime;
+      });
+      const v=((jn?jb/jn:0)+rtt/2+0.05)*1000;
+      lagMs=Math.max(0,Math.min(1500,lagMs?lagMs*0.7+v*0.3:v));
+    }catch(e){}
   }
-  // if the transfer stalls, ask the coordinator to send it again
-  setInterval(()=>{ if(rx&&Date.now()-rx.last>8000){ rx=null; status('Song transfer stalled, retrying…',true); asend({t:'hello',have:''}); } },3000);
+  setInterval(measure,2000);
   // any tap anywhere unlocks sound (phones block sound until the person touches the screen)
   ['pointerdown','touchstart','click'].forEach(ev=>document.addEventListener(ev,()=>ga.unlock(),{passive:true}));
-  let needTap=false;
+  let needTap=false, lastSnd=null;
   setInterval(()=>{
-    const need=!!(base&&base.playing&&ga.buf&&ga.ctx&&ga.ctx.state!=='running');
-    if(need!==needTap){ needTap=need; g.classList.toggle('needtap',need); status(need?'Tap the screen to turn on sound':(ga.buf?'Connected · song ready':'Connected'),connected); }
-    // tiny always-on status line (dim, bottom of the screen)
-    $('gdiag').textContent=[connected?'● connected':'○ not connected',
-      ga.buf?'♪ song ready':(rx?'♪ loading '+Math.floor(rx.got/rx.n*100)+'%':'♪ no song yet'),
-      ga.ctx&&ga.ctx.state==='running'?'sound on':'tap screen for sound'].join('  ·  ');
+    const ok=ga.ok, need=!!(ga.stream&&!ok);
+    if(need!==needTap){ needTap=need; g.classList.toggle('needtap',need); status(need?'Tap the screen to turn on sound':'Connected',connected); }
+    if(ok!==lastSnd&&conn&&conn.open){ lastSnd=ok; conn.send({t:'snd',ok}); }
+    $('gdiag').textContent=[connected?'● connected':'○ not connected', ga.stream?(ok?'♪ sound on':'♪ tap screen for sound'):'♪ waiting for sound', 'lag '+Math.round(lagMs)+' ms'].join('  ·  ');
   },400);
-
-  function openAudio(peer){
-    if(aconn){ try{aconn.close()}catch(e){} aconn=null; }
-    const c=peer.connect(hostId,{reliable:true,serialization:'json',metadata:{audio:true},label:'audio'}); aconn=c;
-    c.on('open',()=>{ c.send({t:'hello',have:ga.key||''}); });
-    c.on('data',m=>{
-      if(m.t==='audio-start'){ rx={id:m.id,size:m.size,key:m.key,n:m.n,parts:new Array(m.n),got:0,last:Date.now()}; problem=false; status('Loading song 0%',true); ui(); }
-      if(m.t==='audio-chunk'&&rx&&rx.id===m.id){
-        const s=atob(m.d), u=new Uint8Array(s.length); for(let k=0;k<s.length;k++) u[k]=s.charCodeAt(k);
-        if(!rx.parts[m.i]){ rx.parts[m.i]=u; rx.got++; }
-        rx.last=Date.now(); status('Loading song '+Math.floor(rx.got/rx.n*100)+'%',true);
-        if(rx.got>=rx.n) finishSong();
-      }
-      if(m.t==='audio-end'&&rx&&rx.id===m.id&&rx.got<rx.n){ rx=null; status('Song transfer incomplete, asking again…',true); asend({t:'hello',have:''}); }
-    });
-    c.on('close',()=>{ if(aconn===c){ aconn=null; setTimeout(()=>{ if(connected&&!aconn) openAudio(peer); },2000); } });
-    c.on('error',()=>{});
-  }
 
   function connect(){
     status('Connecting…');
     if(typeof Peer==='undefined'){ status('Could not load PeerJS. Check the internet connection.'); return; }
     const peer=new Peer();
+    peer.on('call',call=>{ call.answer(); callRef=call; call.on('stream',s=>ga.attach(s)); call.on('close',()=>{ if(callRef===call){ callRef=null; ga.detach(); } }); call.on('error',()=>{}); });
     peer.on('open',()=>{
-      conn=peer.connect(hostId,{reliable:true});          // control connection: clock sync + show state (default settings, as before)
-      conn.on('open',()=>{connected=true;status('Connected',true);ui();burst();openAudio(peer);});
+      conn=peer.connect(hostId,{reliable:true});
+      conn.on('open',()=>{connected=true;lastSnd=null;status('Connected',true);ui();burst();});
       conn.on('data',m=>{
         if(m.t==='pong'){ const rtt=Date.now()-m.c; if(rtt<best){best=rtt;offset=m.s+rtt/2-Date.now()} }
         if(m.t==='state'){ const wasPlaying=base&&base.playing; base=m;
           if(!m.playing) eng.reset(); else if(!wasPlaying) eng.reset(); }
       });
-      conn.on('close',()=>{connected=false;rx=null;aconn=null;ui();status('Disconnected, retrying…');eng.reset();ga.stop();setTimeout(()=>{peer.destroy();connect()},2000)});
+      conn.on('close',()=>{connected=false;ui();status('Disconnected, retrying…');eng.reset();ga.detach();setTimeout(()=>{peer.destroy();connect()},2000)});
       conn.on('error',()=>{});
     });
     peer.on('error',e=>{connected=false;ui();status('Can’t reach the coordinator ('+e.type+'), retrying…');setTimeout(()=>{peer.destroy();connect()},3000)});
