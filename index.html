@@ -66,7 +66,7 @@ display:grid;place-items:end start}
 <main id="host" hidden>
   <header>
     <h1>Light show</h1>
-    <p class="muted" id="ver" style="margin:0 0 .4em;font-size:.8rem">Version 17</p>
+    <p class="muted" id="ver" style="margin:0 0 .4em;font-size:.8rem">Version 18</p>
     <p class="muted" id="hostStatus">Starting…</p>
     <button id="hostFs" class="ghost">Go full screen</button>
   </header>
@@ -94,6 +94,12 @@ display:grid;place-items:end start}
     <div class="row split">
       <button id="pvLaptop" class="ghost">Preview on laptop</button>
       <button id="pvPhones" class="ghost">Preview on phones</button>
+    </div>
+    <div>
+      <label class="muted"><input type="checkbox" id="autoSync" checked> Delay the laptop sound to match the phones</label>
+      <div class="muted" id="syncInfo">Laptop sound delay: 0 ms</div>
+      <label for="trim" class="muted">Fine-tune: <span id="trimVal">0</span> ms (more = laptop sound later)</label>
+      <input type="range" id="trim" min="-200" max="300" step="10" value="0">
     </div>
     <div>
       <label for="delay" class="muted">Light delay: <span id="delayVal">0</span> ms (raise it if the sound arrives late, e.g. Bluetooth speakers)</label>
@@ -215,12 +221,13 @@ const fmt = s => { s=Math.max(0,s); return Math.floor(s/60)+':'+(s%60).toFixed(1
 
 /* ================= WEB AUDIO PLAYER (no <audio> element / blob URL needed) ================= */
 class WebPlayer {
-  constructor(){ this._l={}; this.ctx=null; this.dest=null; this.buf=null; this.src=null; this.off=0; this.t0=0; this.playing=false; this.duration=0; }
+  constructor(){ this._l={}; this.ctx=null; this.dest=null; this.dly=null; this.buf=null; this.src=null; this.off=0; this.t0=0; this.playing=false; this.duration=0; }
   addEventListener(t,f){ (this._l[t]=this._l[t]||[]).push(f); }
   emit(t){ (this._l[t]||[]).slice().forEach(f=>f({type:t})); }
   ensure(){
     if(!this.ctx){ const AC=window.AudioContext||window.webkitAudioContext; this.ctx=new AC(); }
     if(!this.dest) this.dest=this.ctx.createMediaStreamDestination();   // live audio feed that is sent to the devices
+    if(!this.dly){ this.dly=this.ctx.createDelay(1.5); this.dly.connect(this.ctx.destination); }   // laptop speakers (delayed to match the phones)
     return this.ctx;
   }
   get paused(){ return !this.playing; }
@@ -247,7 +254,7 @@ class WebPlayer {
     this.emit('canplay');
   }
   _start(){
-    const s=this.ctx.createBufferSource(); s.buffer=this.buf; s.connect(this.ctx.destination); s.connect(this.dest);
+    const s=this.ctx.createBufferSource(); s.buffer=this.buf; s.connect(this.dly); s.connect(this.dest);
     s.onended=()=>{ if(this.src===s && this.playing){ this.playing=false; this.off=0; this.src=null; this.emit('ended'); } };
     this.src=s; this.t0=this.ctx.currentTime; this.playing=true;
     s.start(0,this.off);
@@ -653,7 +660,18 @@ function startHost(){
   try{ audio.ensure(); }catch(e){}
   const conns=new Set();            // control connections (one per device): clock sync + show state
   const devs=new Map();             // device peer id -> {ctrl, aud, ready, bad, have}  (aud = separate connection that carries the song)
-  let session=null, delay=0, seeking=false;
+  let session=null, delay=0, seeking=false, autoD=0, trim=0, curD=0;
+  function applyDelay(){
+    const want=Math.max(0,Math.min(1.2,((($('autoSync').checked)?autoD:0)+trim)/1000));
+    if(Math.abs(want-curD)>0.04||(want===0&&curD!==0)){ curD=want; try{ audio.dly.delayTime.setTargetAtTime(want,audio.ctx.currentTime,0.6); }catch(e){} }
+    $('syncInfo').textContent='Laptop sound delay: '+Math.round(curD*1000)+' ms';
+  }
+  $('trim').addEventListener('input',e=>{ trim=+e.target.value; $('trimVal').textContent=trim; applyDelay(); });
+  $('autoSync').addEventListener('change',applyDelay);
+  setInterval(()=>{   // the phones report how late their sound is; match the laptop to the middle one
+    const L=[...devs.values()].filter(d=>d.ctrl&&d.snd).map(d=>d.lag||0).sort((a,b)=>a-b);
+    autoD=L.length?L[L.length>>1]:0; applyDelay();
+  },2000);
 
   const hostScenes=makeScenes($('hostScene'));
   const eng = makeEngine({
@@ -720,7 +738,7 @@ function startHost(){
   (function loop(){
     if(session&&!audio.paused){
       const pos=audio.currentTime;
-      if(session.local){ eng.tick(pos-delay/1000); hostScenes.render(pos-delay/1000); }
+      if(session.local){ eng.tick(pos-delay/1000-curD); hostScenes.render(pos-delay/1000-curD); }
       if(session.stopAt!=null && pos>=session.stopAt) endAll(false);
     }
     if(!seeking){$('seek').value=audio.currentTime;$('time').textContent=fmt(audio.currentTime)+' / '+fmt(audio.duration||0)}
@@ -793,7 +811,7 @@ function startHost(){
       c.on('open',()=>{ d.ctrl=c; conns.add(c); sendState(); callDevice(d,c); upd(); });
       c.on('data',m=>{
         if(m.t==='ping') c.send({t:'pong',c:m.c,s:Date.now()});
-        if(m.t==='snd'){ d.snd=!!m.ok; upd(); }
+        if(m.t==='snd'){ d.snd=!!m.ok; d.lag=+m.lag||0; upd(); }
       });
       const gone=()=>{ conns.delete(c); if(d.ctrl===c){ d.ctrl=null; if(d.call){ try{d.call.close()}catch(e){} d.call=null; } devs.delete(c.peer); } upd(); };
       c.on('close',gone); c.on('error',gone);
@@ -868,13 +886,18 @@ function startGuest(hostId){
     }catch(e){}
   }
   setInterval(measure,2000);
+  // ask the browser for the smallest receive buffer, and ask the sender for stereo, higher-quality Opus
+  function lowLatency(call){
+    try{ (call.peerConnection.getReceivers()||[]).forEach(r=>{ if(r.track&&r.track.kind==='audio'){ try{r.jitterBufferTarget=0}catch(e){} try{r.playoutDelayHint=0}catch(e){} } }); }catch(e){}
+  }
+  const opusSdp=sdp=>sdp.replace(/a=fmtp:(\d+) ([^\r\n]*)/g,(m,pt,rest)=>(/minptime|useinbandfec/.test(rest)&&!/stereo=1/.test(rest))?'a=fmtp:'+pt+' '+rest+';stereo=1;sprop-stereo=1;maxaveragebitrate=128000':m);
   // any tap anywhere unlocks sound (phones block sound until the person touches the screen)
   ['pointerdown','touchstart','click'].forEach(ev=>document.addEventListener(ev,()=>ga.unlock(),{passive:true}));
-  let needTap=false, lastSnd=null;
+  let needTap=false, lastSnd=null, lastSent=0;
   setInterval(()=>{
     const ok=ga.ok, need=!!(ga.stream&&!ok);
     if(need!==needTap){ needTap=need; g.classList.toggle('needtap',need); status(need?'Tap the screen to turn on sound':'Connected',connected); }
-    if(ok!==lastSnd&&conn&&conn.open){ lastSnd=ok; conn.send({t:'snd',ok}); }
+    if(conn&&conn.open&&(ok!==lastSnd||Date.now()-lastSent>2000)){ lastSnd=ok; lastSent=Date.now(); conn.send({t:'snd',ok,lag:Math.round(lagMs)}); }
     $('gdiag').textContent=[connected?'● connected':'○ not connected', ga.stream?(ok?'♪ sound on':'♪ tap screen for sound'):'♪ waiting for sound', 'lag '+Math.round(lagMs)+' ms'].join('  ·  ');
   },400);
 
@@ -882,7 +905,7 @@ function startGuest(hostId){
     status('Connecting…');
     if(typeof Peer==='undefined'){ status('Could not load PeerJS. Check the internet connection.'); return; }
     const peer=new Peer();
-    peer.on('call',call=>{ call.answer(); callRef=call; call.on('stream',s=>ga.attach(s)); call.on('close',()=>{ if(callRef===call){ callRef=null; ga.detach(); } }); call.on('error',()=>{}); });
+    peer.on('call',call=>{ call.answer(undefined,{sdpTransform:opusSdp}); callRef=call; call.on('stream',s=>{ ga.attach(s); lowLatency(call); }); call.on('close',()=>{ if(callRef===call){ callRef=null; ga.detach(); } }); call.on('error',()=>{}); });
     peer.on('open',()=>{
       conn=peer.connect(hostId,{reliable:true});
       conn.on('open',()=>{connected=true;lastSnd=null;status('Connected',true);ui();burst();});
